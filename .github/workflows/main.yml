@@ -1,12 +1,23 @@
-name: Docker Image Release Workflow Multi-Arch
+
+name: Build and Publish Docker Image
+
 on:
   release:
     types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   docker:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Login to Docker Hub
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Docker Hub login
         uses: docker/login-action@v3
         with:
           username: praveenkarunarathne
@@ -15,12 +26,15 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
 
-      - name: Set up Docker Buildx
+      - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
+          context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: praveenkarunarathne/google-cloud-run-proxy:latest
+          tags: |
+            praveenkarunarathne/google-cloud-run-proxy:latest
+            praveenkarunarathne/google-cloud-run-proxy:${{ github.event.release.tag_name || 'manual' }}
