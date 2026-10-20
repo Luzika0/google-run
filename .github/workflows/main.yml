@@ -36,5 +36,6 @@ jobs:
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            praveenkarunarathne/google-cloud-run-proxy:latest
-            praveenkarunarathne/google-cloud-run-proxy:${{ github.event.release.tag_name || 'manual' }}
+            panha123456765432/google-cloud-run-proxy:latest
+            panha123456765432/google-cloud-run-proxy:${{ github.event.release.tag_name || 'manual' }}
+
