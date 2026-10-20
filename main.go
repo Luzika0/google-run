@@ -9,25 +9,36 @@ import (
 	"time"
 )
 
-func handleClient(clientConn net.Conn, targetAddr string) {
-	defer clientConn.Close()
+func handleClient(client net.Conn, target string) {
+	defer client.Close()
 
-	remoteConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+	upstream, err := net.DialTimeout(
+		"tcp",
+		target,
+		10*time.Second,
+	)
 	if err != nil {
-		log.Printf("Failed to connect to upstream %s: %v", targetAddr, err)
+		log.Printf("Cannot connect to upstream %s: %v", target, err)
 		return
 	}
-	defer remoteConn.Close()
+	defer upstream.Close()
+
+	done := make(chan struct{})
 
 	go func() {
-		if _, err := io.Copy(remoteConn, clientConn); err != nil {
-			log.Printf("Client-to-upstream copy error: %v", err)
+		_, err := io.Copy(upstream, client)
+		if err != nil {
+			log.Printf("Client copy error: %v", err)
 		}
+		close(done)
 	}()
 
-	if _, err := io.Copy(clientConn, remoteConn); err != nil {
-		log.Printf("Upstream-to-client copy error: %v", err)
+	_, err = io.Copy(client, upstream)
+	if err != nil {
+		log.Printf("Upstream copy error: %v", err)
 	}
+
+	<-done
 }
 
 func main() {
@@ -36,28 +47,32 @@ func main() {
 		port = "8080"
 	}
 
-	serverIP := os.Getenv("V2RAY_SERVER_IP")
-	if serverIP == "" {
-		log.Fatal("V2RAY_SERVER_IP is not set")
+	ip := os.Getenv("V2RAY_SERVER_IP")
+	if ip == "" {
+		log.Fatal("V2RAY_SERVER_IP is required")
 	}
 
-	targetAddr := net.JoinHostPort(serverIP, "80")
+	upstreamPort := os.Getenv("V2RAY_SERVER_PORT")
+	if upstreamPort == "" {
+		upstreamPort = "80"
+	}
+
+	target := net.JoinHostPort(ip, upstreamPort)
 
 	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("Failed to listen on port %s: %v", port, err)
+		log.Fatal(err)
 	}
 	defer listener.Close()
 
-	log.Printf("Listening on port %s; forwarding to %s", port, targetAddr)
+	log.Printf("Listening on :%s; upstream: %s", port, target)
 
 	for {
-		clientConn, err := listener.Accept()
+		client, err := listener.Accept()
 		if err != nil {
 			log.Printf("Accept error: %v", err)
 			continue
 		}
-
-		go handleClient(clientConn, targetAddr)
+		go handleClient(client, target)
 	}
 }
