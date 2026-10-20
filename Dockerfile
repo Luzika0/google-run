@@ -1,10 +1,17 @@
-FROM golang:1.21-alpine AS build
-WORKDIR /app
-COPY . .
-RUN go mod init proxy
-RUN go mod tidy
-RUN go build -ldflags="-s -w" -o proxy
 
-FROM gcr.io/distroless/static
-COPY --from=build /app/proxy /
+FROM golang:1.23-alpine AS builder
+
+WORKDIR /app
+COPY go.mod ./
+COPY main.go ./
+
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /proxy ./main.go
+
+FROM alpine:3.22
+
+RUN adduser -D -H -u 10001 appuser
+COPY --from=builder /proxy /proxy
+
+USER appuser
+EXPOSE 8080
 ENTRYPOINT ["/proxy"]
