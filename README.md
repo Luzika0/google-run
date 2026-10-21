@@ -51,7 +51,8 @@ The Go proxy supports these environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Port Cloud Run routes requests to. |
-| `V2RAY_SERVER_IP` | Required | Single upstream server IP address. The application exits if this is missing. |\n| `V2RAY_SERVER_PORT` | `80` | Upstream TCP port. |
+| `V2RAY_SERVER_IP` | Required | Single upstream server IP address. The application exits if this is missing. |
+| `V2RAY_SERVER_PORT` | `80` | Upstream TCP port. |
 | `MAX_CONNECTIONS` | `500` | Maximum concurrent proxy sessions handled by the application per instance. Set a lower value for small-memory instances. |
 
 ### 🔌 Set the upstream and connection limit
