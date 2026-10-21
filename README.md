@@ -1,6 +1,6 @@
 # 🚀 Google Cloud Run Proxy
 
-A lightweight Go TCP/WebSocket proxy running on **Google Cloud Run**, with **Direct VPC egress** and **Cloud NAT** for outbound traffic.
+A lightweight Go TCP stream forwarder running on **Google Cloud Run**, with **Direct VPC egress** and **Cloud NAT** for outbound traffic. The application accepts TCP connections on Cloud Run's configured container port and forwards bytes to a configured upstream TCP server. The deployed client-to-service protocol must be compatible with Cloud Run's HTTP(S)/WebSocket request handling; this application does not implement a WebSocket handshake itself.
 
 ## 📚 Contents
 
@@ -52,32 +52,26 @@ The Go proxy supports these environment variables:
 
 | Variable | Default | Description |
 |---|---|---|
-| `PORT` | `8080` | Port Cloud Run routes requests to. |
-| `V2RAY_SERVER_IP` | Required | Single upstream server IP address. The application exits if this is missing. |
-| `V2RAY_SERVER_PORT` | `80` | Upstream TCP port. |
-| `MAX_CONNECTIONS` | `500` | Maximum concurrent proxy sessions handled by the application per instance. Set a lower value for small-memory instances. |
+| `PORT` | `8080` | Local port on which the Go process listens. Cloud Run provides this variable automatically. |
+| `V2RAY_SERVER_IP` | Required | Upstream server IP address. The application exits if this is missing. |
+| `DIAL_TIMEOUT` | `10s` | Maximum time to establish the upstream TCP connection. Accepts Go duration syntax, such as `5s`, `10s`, or `1m`. |
 
-### 🔌 Set the upstream and connection limit
+The current `main.go` hardcodes the upstream port to `80`. It does not implement `V2RAY_SERVER_PORT`, `MAX_CONNECTIONS`, or an idle timeout. Each accepted client connection starts a handler, so the application itself currently has no explicit concurrent-connection cap.
 
-For example, set the upstream server and cap the application at **20 concurrent proxy sessions** (a cautious starting point for a 128 MiB instance):
+### 🔌 Configure the upstream and dial timeout
 
-```bash
-gcloud run services update google-cloud-run-proxy \
-  --project="YOUR_PROJECT_ID" \
-  --region="asia-southeast1" \
-  --update-env-vars="V2RAY_SERVER_IP=47.237.149.117,V2RAY_SERVER_PORT=80,MAX_CONNECTIONS=20"
-```
-
-Replace `YOUR_PROJECT_ID` with your actual project ID. If the upstream variables are already configured correctly, you can update only the connection limit:
+Set the upstream IP and dial timeout. Replace `YOUR_PROJECT_ID` with your actual project ID:
 
 ```bash
 gcloud run services update google-cloud-run-proxy \
   --project="YOUR_PROJECT_ID" \
   --region="asia-southeast1" \
-  --update-env-vars="MAX_CONNECTIONS=20"
+  --update-env-vars="V2RAY_SERVER_IP=YOUR_UPSTREAM_IP,DIAL_TIMEOUT=5s"
 ```
 
-> ⚠️ **Resource note:** The code default is `MAX_CONNECTIONS=500`; this is only a software limit, not a promise that the instance can handle 500 sessions. For the recommended starting profile below, explicitly set `MAX_CONNECTIONS=80`. Only positive integer values override the default; invalid or non-positive values are ignored. The limit is per instance, and each accepted client session opens its own upstream TCP connection.
+Use the real upstream IP address for `YOUR_UPSTREAM_IP`. The example sets a 5-second connection-establishment timeout; omit `DIAL_TIMEOUT` to use the code default of 10 seconds.
+
+> ⚠️ **Resource note:** The current Go code does not enforce `MAX_CONNECTIONS`. Cloud Run concurrency controls the number of in-flight requests per instance, but it is not a substitute for application-level backpressure in every connection model. Choose a conservative Cloud Run concurrency and memory setting, then test and monitor real traffic. Each proxy session opens an upstream TCP connection.
 
 ## 🧪 Pre-deployment checklist
 
@@ -85,7 +79,7 @@ Complete these checks **before deploying a new revision**:
 
 1. **Confirm the upstream is reachable.** Verify the destination IP and port are correct, the upstream service is listening, and its firewall allows traffic from your Cloud NAT public IP (if the upstream uses an IP allowlist).
 2. **Confirm the network path.** Check the Cloud Run region, VPC network, subnet, Direct VPC egress setting, routes, egress firewall rules, Cloud Router, and Cloud NAT coverage. Use `all-traffic` only when the VPC/NAT path is correctly configured for internet egress.
-3. **Choose a realistic connection limit.** Start with `MAX_CONNECTIONS=80` and Cloud Run concurrency `100`. Do not set the application limit higher than the instance has been tested to support.
+3. **Choose conservative Cloud Run concurrency.** Start with a low concurrency setting for testing and increase it only after checking memory, CPU, errors, and actual connection behavior. The current application does not enforce its own `MAX_CONNECTIONS` limit.
 4. **Choose enough memory.** Use `256Mi` as the recommended initial test profile for this proxy rather than assuming `128Mi` is enough for many long-lived sessions. Memory usage depends on connection count, traffic, buffers, and runtime overhead.
 5. **Keep scaling limits intentional.** `--max=1` limits the service to one instance and `--min=0` allows scale-to-zero. This reduces potential instance scaling but also means there is no second instance to absorb bursts.
 6. **Check the image.** Build and push a new container image after changing source code. Updating the README or GitHub source alone does not update a deployed Cloud Run revision.
@@ -93,9 +87,9 @@ Complete these checks **before deploying a new revision**:
 
 ### 🔬 Test progressively
 
-Increase the application connection limit only after the previous level works under representative traffic. For example, test 20, then 50, then 80–100 connections. At each step, check memory, CPU, latency, disconnects, HTTP 429/503 responses, and upstream connection errors. These are test stages, not guaranteed capacity levels.
+Start with a small number of real client sessions, then increase Cloud Run concurrency in stages only after the previous test is stable. At each step, check memory, CPU, latency, disconnects, HTTP 429/503 responses, and upstream connection errors. These are test stages, not guaranteed capacity levels.
 
-Do not test 1,000 long-lived connections on a 128 MiB instance and assume the configured limit means they will work. A higher limit permits more work; it does not add CPU, memory, network bandwidth, or Cloud Run instances.
+Do not assume that a Cloud Run concurrency setting or a large number of Go goroutines guarantees 1,000 healthy long-lived sessions. More concurrent sessions consume resources and do not add CPU, memory, network bandwidth, or Cloud Run instances.
 
 ## 🧠 CPU, RAM, and connection sizing
 
@@ -103,16 +97,16 @@ Do not test 1,000 long-lived connections on a 128 MiB instance and assume the co
 
 - **CPU (1 vCPU):** handles connection setup, Go runtime work, copying data in both directions, and logging. More active traffic or many busy connections can increase CPU demand. A higher connection limit does not make the CPU faster.
 - **RAM (128/256/512 MiB):** is shared by the Go runtime, goroutines, network buffers, connection state, and the container. Each session uses resources on both the client and upstream sides. Actual usage varies with traffic and buffering, so there is no reliable fixed RAM-per-connection value.
-- **Cloud Run concurrency:** maximum number of requests Cloud Run allows to be in flight on one instance. Long-lived WebSocket requests occupy concurrency for their lifetime. This is separate from the Go application's `MAX_CONNECTIONS` semaphore.
-- **Application connection cap:** `MAX_CONNECTIONS` limits accepted proxy sessions in this process. If it is lower than Cloud Run concurrency, the application cap can be reached first. If it is much higher, resource exhaustion may happen before the cap is reached.
-- **Maximum instances:** `--max=1` means all supported load must fit on one instance. It does not guarantee a specific throughput or 1,000 simultaneous healthy connections.
+- **Cloud Run concurrency:** maximum number of requests Cloud Run allows to be in flight on one instance. Long-lived WebSocket requests occupy concurrency for their lifetime. The exact behavior depends on the protocol path supported by the deployed service.
+- **Application connection cap:** the current `main.go` has no `MAX_CONNECTIONS` semaphore, so each accepted TCP connection starts a handler. Use conservative Cloud Run settings and consider implementing application-level backpressure if you need a hard cap.
+- **Maximum instances:** `--max=1` limits the service to one instance. It does not guarantee a specific throughput or 1,000 simultaneous healthy connections.
 
-| Profile | Cloud Run CPU | Cloud Run memory | Cloud Run concurrency | `MAX_CONNECTIONS` | Guidance |
-|---|---:|---:|---:|---:|---|
-| Small test | 1 vCPU | 128 MiB | 20 | 10–20 | Use only for light testing; little memory headroom |
-| Recommended starting test | 1 vCPU | 256 MiB | 100 | 80 | Start here, then measure actual usage |
-| Larger test | 1 vCPU | 512 MiB | 200 | 150–200 | Test only if metrics show more headroom is needed |
-| High connection target | At least test CPU needs | 512 MiB or more to evaluate | Up to 1,000 | Increase in stages | Not guaranteed; load-test and monitor before production |
+| Profile | Cloud Run CPU | Cloud Run memory | Cloud Run concurrency | Guidance |
+|---|---:|---:|---:|---|
+| Small test | 1 vCPU | 128 MiB | 10–20 | Light testing only; limited memory headroom |
+| Recommended starting test | 1 vCPU | 256 MiB | 20–50 | A conservative baseline to measure |
+| Larger test | 1 vCPU | 512 MiB | 50–100 | Increase only if metrics show sufficient headroom |
+| High connection target | Based on load tests | 512 MiB or more to evaluate | Increase gradually | Not guaranteed; load-test and monitor before production |
 
 The table is a **starting guide, not a Cloud Run capacity guarantee**. A 1 vCPU / 256 MiB instance may still be overloaded by high-throughput connections. If you need 1,000 simultaneous long-lived sessions, load-test using your real traffic pattern and increase resources based on observed memory/CPU. With `--max=1`, increasing resources may raise per-instance cost; increasing `--max` can add capacity but may increase cost and is outside the one-instance design.
 
@@ -141,13 +135,13 @@ gcloud run deploy "$SERVICE" \
   --cpu="1" \
   --min="0" \
   --max="1" \
-  --concurrency="100" \
-  --update-env-vars="MAX_CONNECTIONS=80"
+  --concurrency="20" \
+  --update-env-vars="DIAL_TIMEOUT=5s"
 ```
 
 Update the image reference to the image you actually built and pushed. If you deploy an existing image, code changes in GitHub will not be included until you rebuild and push a new image.
 
-> ℹ️ This example intentionally starts with `256Mi`, concurrency `100`, and `MAX_CONNECTIONS=80` as a cautious test profile. It is not a guarantee of 80 connections under every traffic pattern. `--max=1` limits the service to one instance; `--min=0` allows scale-to-zero. With only one instance, bursts or long-lived WebSocket sessions can still result in HTTP 429 responses when no instance capacity is available. No connection-limit value guarantees zero 429 errors.
+> ℹ️ This example starts with `256Mi`, concurrency `20`, and `DIAL_TIMEOUT=5s` as a conservative test profile. These values are not a capacity guarantee. `--max=1` limits the service to one instance; `--min=0` allows scale-to-zero. With only one instance, bursts or long-lived requests can still result in HTTP 429 responses when no instance capacity is available. The current code does not enforce an application-level connection cap.
 
 ### 🔐 Public access and authentication
 
@@ -219,7 +213,7 @@ Possible charges include Cloud Run CPU and memory usage, Cloud NAT usage and dat
 Monitor:
 
 - 📈 Cloud Run request count, latency, instance count, CPU, memory, and restarts.
-- 🔁 Active WebSocket/proxy sessions and application connection-limit logs.
+- 🔁 Active proxy sessions, upstream connection failures, and connection termination logs.
 - 🌐 Cloud NAT flow logs, dropped packets, and port allocation errors.
 - 📦 Actual proxy data transfer, not just successful handshakes.
 - 💳 Daily and monthly Cloud Run, Cloud NAT, and network transfer costs.
@@ -243,7 +237,7 @@ Monitor:
 ### Cloud Run returns HTTP 429
 - Inspect Cloud Run request logs and instance metrics around the same timestamp.
 - With `--max=1`, one busy or unavailable instance can leave new requests without capacity.
-- Increasing `MAX_CONNECTIONS` only changes the application's own session cap; it does not add Cloud Run instances or guarantee that platform-level 429 responses disappear.
+- The current `main.go` does not read `MAX_CONNECTIONS`. Adjust Cloud Run concurrency and scaling deliberately, and implement an application-level cap if required; neither setting guarantees that platform-level 429 responses disappear.
 
 ### Unexpected costs
 - Review Cloud Run, Cloud NAT, and network data transfer as separate billing categories.
