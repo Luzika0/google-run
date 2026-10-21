@@ -51,7 +51,7 @@ The Go proxy supports these environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Port Cloud Run routes requests to. |
-| `V2RAY_SERVER_PORT` | `80` | Upstream TCP port. |
+| `V2RAY_SERVER_IP` | Required | Single upstream server IP address. The application exits if this is missing. |\n| `V2RAY_SERVER_PORT` | `80` | Upstream TCP port. |
 | `MAX_CONNECTIONS` | `500` | Maximum concurrent proxy sessions handled by the application per instance. Set a lower value for small-memory instances. |
 
 ### 🔌 Set the upstream and connection limit
@@ -74,7 +74,7 @@ gcloud run services update google-cloud-run-proxy \
   --update-env-vars="MAX_CONNECTIONS=20"
 ```
 
-> ⚠️ **Resource note:** `MAX_CONNECTIONS=20` is a starting point, not a guarantee that 60 sessions fit safely in 128 MiB RAM. Watch memory and errors, then adjust gradually. Increasing this variable does not merge separate client sessions into one upstream connection.
+> ⚠️ **Resource note:** The code default is `MAX_CONNECTIONS=500`, but that is not a safe guarantee for a 128 MiB Cloud Run instance. Start lower (for example, 10–20), monitor memory and errors, and increase gradually only after testing. The limit applies per instance and does not merge separate client sessions into one upstream connection. Only positive integer values override the default; invalid or non-positive values are ignored.
 
 ## 🚢 Deploy to Cloud Run
 
