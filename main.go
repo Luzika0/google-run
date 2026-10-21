@@ -2,77 +2,90 @@
 package main
 
 import (
-	"io"
 	"log"
-	"net"
+	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
-	"time"
+	"strings"
 )
 
-func handleClient(client net.Conn, target string) {
-	defer client.Close()
-
-	upstream, err := net.DialTimeout(
-		"tcp",
-		target,
-		10*time.Second,
-	)
-	if err != nil {
-		log.Printf("Cannot connect to upstream %s: %v", target, err)
-		return
+func env(key, fallback string) string {
+	value := os.Getenv(key)
+	if value == "" {
+		return fallback
 	}
-	defer upstream.Close()
-
-	done := make(chan struct{})
-
-	go func() {
-		_, err := io.Copy(upstream, client)
-		if err != nil {
-			log.Printf("Client copy error: %v", err)
-		}
-		close(done)
-	}()
-
-	_, err = io.Copy(client, upstream)
-	if err != nil {
-		log.Printf("Upstream copy error: %v", err)
-	}
-
-	<-done
+	return value
 }
 
 func main() {
-	port := os.Getenv("PORT")
-	if port == "" {
-		port = "8080"
+	port := env("PORT", "8080")
+	wsPath := env("WS_PATH", "/TG-@Not_Ragnar")
+	vlessUUID := os.Getenv("VLESS_UUID")
+
+	if vlessUUID == "" {
+		log.Fatal("VLESS_UUID is required")
 	}
 
-	ip := os.Getenv("V2RAY_SERVER_IP")
-	if ip == "" {
-		log.Fatal("V2RAY_SERVER_IP is required")
-	}
-
-	upstreamPort := os.Getenv("V2RAY_SERVER_PORT")
-	if upstreamPort == "" {
-		upstreamPort = "80"
-	}
-
-	target := net.JoinHostPort(ip, upstreamPort)
-
-	listener, err := net.Listen("tcp", ":"+port)
-	if err != nil {
-		log.Fatal(err)
-	}
-	defer listener.Close()
-
-	log.Printf("Listening on :%s; upstream: %s", port, target)
-
-	for {
-		client, err := listener.Accept()
-		if err != nil {
-			log.Printf("Accept error: %v", err)
-			continue
+	upstreamURL := os.Getenv("UPSTREAM_URL")
+	if upstreamURL == "" {
+		ip := os.Getenv("V2RAY_SERVER_IP")
+		if ip == "" {
+			log.Fatal("V2RAY_SERVER_IP or UPSTREAM_URL is required")
 		}
-		go handleClient(client, target)
+		upstreamPort := env("V2RAY_SERVER_PORT", "80")
+		upstreamURL = "http://" + ip + ":" + upstreamPort
+	}
+
+	target, err := url.Parse(upstreamURL)
+	if err != nil || target.Host == "" ||
+		(target.Scheme != "http" && target.Scheme != "https") {
+		log.Fatal("Invalid UPSTREAM_URL")
+	}
+
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	proxy.ErrorHandler = func(
+		w http.ResponseWriter,
+		r *http.Request,
+		err error,
+	) {
+		log.Printf("Upstream error: %v", err)
+		http.Error(w, "Upstream unavailable",
+			http.StatusBadGateway)
+	}
+
+	http.HandleFunc("/healthz", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	http.HandleFunc("/", func(
+		w http.ResponseWriter,
+		r *http.Request,
+	) {
+		if r.URL.Path != wsPath {
+			http.NotFound(w, r)
+			return
+		}
+
+		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+			http.Error(w, "WebSocket upgrade required",
+				http.StatusUpgradeRequired)
+			return
+		}
+
+		// UUID authentication is performed by Xray upstream.
+		proxy.ServeHTTP(w, r)
+	})
+
+	log.Printf("Listening on :%s", port)
+	log.Printf("WebSocket path configured")
+	log.Printf("Upstream: %s", target.Host)
+
+	if err := http.ListenAndServe(":"+port, nil); err != nil {
+		log.Fatal(err)
 	}
 }
