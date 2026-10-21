@@ -20,7 +20,7 @@ func env(key, fallback string) string {
 
 func main() {
 	port := env("PORT", "8080")
-	wsPath := env("WS_PATH", "/TG-@Not_Ragnar")
+	wsPath := env("WS_PATH", "/")
 	vlessUUID := os.Getenv("VLESS_UUID")
 
 	if vlessUUID == "" {
