@@ -12,25 +12,24 @@ import (
 
 const (
 	defaultPort           = "8080"
-	defaultUpstreamPort   = "443" // Standard secure port for V2Ray/Xray TLS
-	defaultMaxConnections = 500   // Protects Cloud Run from running out of memory
-	dialTimeout           = 10 * time.Second
+	defaultUpstreamPort   = "80"   // Matches your active upstream configuration
+	defaultMaxConnections = 500  
+	dialTimeout           = 5 * time.Second // Tightened to drop dead connections faster
 )
 
 func handleClient(clientConn net.Conn, targetAddr string) {
-	// Defer handles connection closures safely exactly once when the function exits
 	defer clientConn.Close()
 
 	remoteConn, err := net.DialTimeout("tcp", targetAddr, dialTimeout)
 	if err != nil {
-		log.Printf("Upstream connection to %s failed: %v", targetAddr, err)
+		log.Printf("Upstream firewall rejection or failure to %s: %v", targetAddr, err)
 		return
 	}
 	defer remoteConn.Close()
 
 	errs := make(chan error, 2)
 
-	// Bidirectional data pipe copy
+	// Bidirectional stream pipes
 	go func() {
 		_, err := io.Copy(remoteConn, clientConn)
 		errs <- err
@@ -40,13 +39,12 @@ func handleClient(clientConn net.Conn, targetAddr string) {
 		errs <- err
 	}()
 
-	// Wait for the first stream copy error/completion to finish
 	err = <-errs
 	if err != nil && !errors.Is(err, net.ErrClosed) {
-		log.Printf("TCP session closing: %v", err)
+		// Log structural context without spamming stack traces
+		log.Printf("Stream terminated: %v", err)
 	}
 
-	// Wait for the second goroutine to exit to prevent data race leaks
 	<-errs
 }
 
@@ -78,33 +76,30 @@ func main() {
 
 	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("Cannot listen on %s: %v", listenAddr, err)
+		log.Fatalf("Network interface binding failed on %s: %v", listenAddr, err)
 	}
 	defer listener.Close()
 
-	// Rate limiting channel tokens (The critical safety mechanism)
 	slots := make(chan struct{}, maxConnections)
 
-	log.Printf("Proxy listening on %s, forwarding to %s (Max Slots: %d)", listenAddr, targetAddr, maxConnections)
+	log.Printf("Proxy online. Forwarding to %s | Max concurrent connections: %d", targetAddr, maxConnections)
 
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept failed: %v", err)
+			log.Printf("Socket accept error: %v", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
-		// Anti-burst pacing delay: Spreads out fast connection setups 
-		// by 2 milliseconds to stop "rate exceeded" errors on upstream firewalls.
-		time.Sleep(2 * time.Millisecond)
+		// ELEVATED PACING DELAY: Spreads out aggressive browser connection requests
+		// to stop upstream firewalls from identifying the proxy traffic as a DDoS burst.
+		time.Sleep(10 * time.Millisecond)
 
-		// Blocks safely if capacity is reached. Traffic queues up in the 
-		// OS network stack instead of causing heavy container crashes.
 		slots <- struct{}{}
 		go func(conn net.Conn) {
 			handleClient(conn, targetAddr)
-			<-slots // Release the slot back when finished
+			<-slots
 		}(clientConn)
 	}
 }
