@@ -51,20 +51,18 @@ The Go proxy supports these environment variables:
 | Variable | Default | Description |
 |---|---|---|
 | `PORT` | `8080` | Port Cloud Run routes requests to. |
-| `V2RAY_SERVER_IPS` | — | Comma-separated upstream IP addresses. Tried in order. |
-| `V2RAY_SERVER_IP` | — | Single upstream IP fallback if `V2RAY_SERVER_IPS` is empty. |
 | `V2RAY_SERVER_PORT` | `80` | Upstream TCP port. |
-| `MAX_CONNECTIONS` | `50` | Maximum concurrent proxy sessions per instance. |
+| `MAX_CONNECTIONS` | `500` | Maximum concurrent proxy sessions handled by the application per instance. Set a lower value for small-memory instances. |
 
 ### 🔌 Set the upstream and connection limit
 
-For example, set the upstream server and allow up to **60 concurrent proxy sessions**:
+For example, set the upstream server and cap the application at **20 concurrent proxy sessions** (a cautious starting point for a 128 MiB instance):
 
 ```bash
 gcloud run services update google-cloud-run-proxy \
   --project="YOUR_PROJECT_ID" \
   --region="asia-southeast1" \
-  --update-env-vars="V2RAY_SERVER_IP=47.237.149.117,V2RAY_SERVER_PORT=80,MAX_CONNECTIONS=60"
+  --update-env-vars="V2RAY_SERVER_IP=47.237.149.117,V2RAY_SERVER_PORT=80,MAX_CONNECTIONS=20"
 ```
 
 Replace `YOUR_PROJECT_ID` with your actual project ID. If the upstream variables are already configured correctly, you can update only the connection limit:
@@ -73,10 +71,10 @@ Replace `YOUR_PROJECT_ID` with your actual project ID. If the upstream variables
 gcloud run services update google-cloud-run-proxy \
   --project="YOUR_PROJECT_ID" \
   --region="asia-southeast1" \
-  --update-env-vars="MAX_CONNECTIONS=60"
+  --update-env-vars="MAX_CONNECTIONS=20"
 ```
 
-> ⚠️ **Resource note:** `MAX_CONNECTIONS=60` is a starting point, not a guarantee that 60 sessions fit safely in 128 MiB RAM. Watch memory and errors, then adjust gradually. Increasing this variable does not merge separate client sessions into one upstream connection.
+> ⚠️ **Resource note:** `MAX_CONNECTIONS=20` is a starting point, not a guarantee that 60 sessions fit safely in 128 MiB RAM. Watch memory and errors, then adjust gradually. Increasing this variable does not merge separate client sessions into one upstream connection.
 
 ## 🚢 Deploy to Cloud Run
 
@@ -104,7 +102,7 @@ gcloud run deploy "$SERVICE" \
   --min="0" \
   --max="1" \
   --concurrency="1000" \
-  --update-env-vars="MAX_CONNECTIONS=60"
+  --update-env-vars="MAX_CONNECTIONS=20"
 ```
 
 Update the image reference to the image you actually built and pushed. If you deploy an existing image, code changes in GitHub will not be included until you rebuild and push a new image.
