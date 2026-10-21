@@ -9,35 +9,43 @@ import (
 	"time"
 )
 
-func handleClient(client net.Conn, target string) {
-	defer client.Close()
+const (
+	upstreamPort = "80"
+	dialTimeout  = 10 * time.Second
+)
 
-	upstream, err := net.DialTimeout(
-		"tcp",
-		target,
-		10*time.Second,
-	)
+func handleClient(clientConn net.Conn, targetAddr string) {
+	defer clientConn.Close()
+
+	// Connect to the upstream V2Ray server.
+	remoteConn, err := net.DialTimeout("tcp", targetAddr, dialTimeout)
 	if err != nil {
-		log.Printf("Cannot connect to upstream %s: %v", target, err)
+		log.Printf("Upstream connection to %s failed: %v", targetAddr, err)
 		return
 	}
-	defer upstream.Close()
+	defer remoteConn.Close()
 
-	done := make(chan struct{})
+	log.Printf("Connected to upstream %s", targetAddr)
 
-	go func() {
-		_, err := io.Copy(upstream, client)
-		if err != nil {
-			log.Printf("Client copy error: %v", err)
+	// Copy data in both directions.
+	done := make(chan struct{}, 2)
+
+	copyData := func(dst, src net.Conn, direction string) {
+		_, copyErr := io.Copy(dst, src)
+		if copyErr != nil {
+			log.Printf("%s ended: %v", direction, copyErr)
 		}
-		close(done)
-	}()
-
-	_, err = io.Copy(client, upstream)
-	if err != nil {
-		log.Printf("Upstream copy error: %v", err)
+		done <- struct{}{}
 	}
 
+	go copyData(remoteConn, clientConn, "client-to-upstream")
+	go copyData(clientConn, remoteConn, "upstream-to-client")
+
+	// When either direction ends, close both connections so
+	// the other copy operation cannot remain blocked forever.
+	<-done
+	_ = clientConn.Close()
+	_ = remoteConn.Close()
 	<-done
 }
 
@@ -47,32 +55,31 @@ func main() {
 		port = "8080"
 	}
 
-	ip := os.Getenv("V2RAY_SERVER_IP")
-	if ip == "" {
-		log.Fatal("V2RAY_SERVER_IP is required")
+	serverIP := os.Getenv("V2RAY_SERVER_IP")
+	if serverIP == "" {
+		log.Fatal("Missing required environment variable V2RAY_SERVER_IP")
 	}
 
-	upstreamPort := os.Getenv("V2RAY_SERVER_PORT")
-	if upstreamPort == "" {
-		upstreamPort = "80"
-	}
+	targetAddr := net.JoinHostPort(serverIP, upstreamPort)
+	listenAddr := ":" + port
 
-	target := net.JoinHostPort(ip, upstreamPort)
-
-	listener, err := net.Listen("tcp", ":"+port)
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("Cannot listen on %s: %v", listenAddr, err)
 	}
 	defer listener.Close()
 
-	log.Printf("Listening on :%s; upstream: %s", port, target)
+	log.Printf("Proxy listening on %s", listenAddr)
+	log.Printf("Forwarding connections to %s", targetAddr)
 
 	for {
-		client, err := listener.Accept()
+		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
+			log.Printf("Accept failed: %v", err)
+			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go handleClient(client, target)
+
+		go handleClient(clientConn, targetAddr)
 	}
 }
