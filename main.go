@@ -1,51 +1,124 @@
+
 package main
 
 import (
+	"container/list"
 	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
 	"strconv"
+	"sync"
 	"time"
 )
 
 const (
 	defaultPort           = "8080"
-	defaultUpstreamPort   = "80"   // Matches your active upstream configuration
-	defaultMaxConnections = 500  
-	dialTimeout           = 5 * time.Second // Tightened to drop dead connections faster
+	defaultUpstreamPort   = "80"
+	defaultMaxConnections = 80
+	dialTimeout           = 5 * time.Second
 )
 
-func handleClient(clientConn net.Conn, targetAddr string) {
+type connectionManager struct {
+	mu     sync.Mutex
+	max    int
+	active map[net.Conn]*list.Element
+	order  *list.List
+}
+
+func newConnectionManager(max int) *connectionManager {
+	return &connectionManager{
+		max:    max,
+		active: make(map[net.Conn]*list.Element),
+		order:  list.New(),
+	}
+}
+
+// Add registers a new connection.
+// If full, it removes and closes the oldest registered connection.
+func (m *connectionManager) Add(conn net.Conn) {
+	var oldest net.Conn
+
+	m.mu.Lock()
+
+	if m.order.Len() >= m.max {
+		oldestElement := m.order.Front()
+		if oldestElement != nil {
+			oldest = oldestElement.Value.(net.Conn)
+			delete(m.active, oldest)
+			m.order.Remove(oldestElement)
+		}
+	}
+
+	element := m.order.PushBack(conn)
+	m.active[conn] = element
+
+	m.mu.Unlock()
+
+	if oldest != nil {
+		log.Printf("Connection limit reached; closing oldest connection")
+		_ = oldest.Close()
+	}
+}
+
+func (m *connectionManager) Remove(conn net.Conn) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if element, ok := m.active[conn]; ok {
+		delete(m.active, conn)
+		m.order.Remove(element)
+	}
+}
+
+func handleClient(
+	clientConn net.Conn,
+	targetAddr string,
+	manager *connectionManager,
+) {
+	defer manager.Remove(clientConn)
 	defer clientConn.Close()
 
-	remoteConn, err := net.DialTimeout("tcp", targetAddr, dialTimeout)
+	remoteConn, err := net.DialTimeout(
+		"tcp",
+		targetAddr,
+		dialTimeout,
+	)
 	if err != nil {
-		log.Printf("Upstream firewall rejection or failure to %s: %v", targetAddr, err)
+		log.Printf("Upstream connection to %s failed: %v", targetAddr, err)
 		return
 	}
 	defer remoteConn.Close()
 
 	errs := make(chan error, 2)
 
-	// Bidirectional stream pipes
 	go func() {
 		_, err := io.Copy(remoteConn, clientConn)
 		errs <- err
 	}()
+
 	go func() {
 		_, err := io.Copy(clientConn, remoteConn)
 		errs <- err
 	}()
 
-	err = <-errs
-	if err != nil && !errors.Is(err, net.ErrClosed) {
-		// Log structural context without spamming stack traces
-		log.Printf("Stream terminated: %v", err)
-	}
+	// When either direction ends, close both sockets so the
+	// other copy operation cannot hold a connection slot forever.
+	firstErr := <-errs
 
-	<-errs
+	_ = clientConn.Close()
+	_ = remoteConn.Close()
+
+	secondErr := <-errs
+
+	for _, copyErr := range []error{firstErr, secondErr} {
+		if copyErr != nil &&
+			!errors.Is(copyErr, net.ErrClosed) &&
+			!errors.Is(copyErr, io.EOF) {
+			log.Printf("Proxy stream ended: %v", copyErr)
+		}
+	}
 }
 
 func main() {
@@ -66,40 +139,40 @@ func main() {
 
 	maxConnections := defaultMaxConnections
 	if value := os.Getenv("MAX_CONNECTIONS"); value != "" {
-		if n, err := strconv.Atoi(value); err == nil && n > 0 {
-			maxConnections = n
+		n, err := strconv.Atoi(value)
+		if err != nil || n <= 0 {
+			log.Fatalf("MAX_CONNECTIONS must be a positive integer: %q", value)
 		}
+		maxConnections = n
 	}
 
 	targetAddr := net.JoinHostPort(serverIP, upstreamPort)
-	listenAddr := ":" + port
 
-	listener, err := net.Listen("tcp", listenAddr)
+	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("Network interface binding failed on %s: %v", listenAddr, err)
+		log.Fatalf("Cannot listen on port %s: %v", port, err)
 	}
 	defer listener.Close()
 
-	slots := make(chan struct{}, maxConnections)
+	manager := newConnectionManager(maxConnections)
 
-	log.Printf("Proxy online. Forwarding to %s | Max concurrent connections: %d", targetAddr, maxConnections)
+	log.Printf(
+		"Proxy online. Upstream: %s | Max connections: %d | Policy: replace oldest",
+		targetAddr,
+		maxConnections,
+	)
 
 	for {
 		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Socket accept error: %v", err)
+			log.Printf("Accept failed: %v", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
-		// ELEVATED PACING DELAY: Spreads out aggressive browser connection requests
-		// to stop upstream firewalls from identifying the proxy traffic as a DDoS burst.
-		time.Sleep(10 * time.Millisecond)
+		// Do not block the accept loop waiting for a free slot.
+		manager.Add(clientConn)
 
-		slots <- struct{}{}
-		go func(conn net.Conn) {
-			handleClient(conn, targetAddr)
-			<-slots
-		}(clientConn)
+		go handleClient(clientConn, targetAddr, manager)
 	}
 }
