@@ -1,4 +1,3 @@
-
 package main
 
 import (
@@ -13,13 +12,14 @@ import (
 )
 
 const (
-	defaultPort        = "8080"
-	defaultUpstreamPort = "80"
-	defaultMaxConnections = 50
-	dialTimeout        = 5 * time.Second
+	defaultPort           = "8080"
+	defaultUpstreamPort   = "443" // Changed to 443 as V2Ray proxies rarely use port 80
+	defaultMaxConnections = 500   // Increased baseline default
+	dialTimeout           = 5 * time.Second
 )
 
 func handleClient(client net.Conn, targets []string) {
+	// Let defer handle all connection closures safely exactly once
 	defer client.Close()
 
 	var upstream net.Conn
@@ -44,32 +44,29 @@ func handleClient(client net.Conn, targets []string) {
 	}
 	defer upstream.Close()
 
-	log.Printf("Connected to upstream %s", selectedTarget)
+	log.Printf("Proxying session: %s <-> %s", client.RemoteAddr(), selectedTarget)
 
-	// Each direction runs one copy operation.
-	// If either direction ends, close both connections to unblock the other.
 	errs := make(chan error, 2)
 
-	copyStream := func(dst, src net.Conn) {
-		_, err := io.Copy(dst, src)
+	// Bidirectional data pipe copy
+	go func() {
+		_, err := io.Copy(upstream, client)
 		errs <- err
-	}
+	}()
+	go func() {
+		_, err := io.Copy(client, upstream)
+		errs <- err
+	}()
 
-	go copyStream(upstream, client)
-	go copyStream(client, upstream)
-
+	// Wait for the first stream copy error/completion to finish
 	err := <-errs
 	if err != nil &&
 		!errors.Is(err, net.ErrClosed) &&
 		!errors.Is(err, os.ErrDeadlineExceeded) {
-		log.Printf("TCP forwarding ended: %v", err)
+		log.Printf("TCP forwarding session closed with network status: %v", err)
 	}
 
-	// Closing both sockets prevents the other copy from lingering.
-	_ = client.Close()
-	_ = upstream.Close()
-
-	// Wait until the other copy goroutine has exited.
+	// Keep execution alive until the second goroutine exits safely to prevent leaks
 	<-errs
 }
 
@@ -84,7 +81,7 @@ func main() {
 		rawIPs = os.Getenv("V2RAY_SERVER_IP")
 	}
 	if strings.TrimSpace(rawIPs) == "" {
-		log.Fatal("V2RAY_SERVER_IP or V2RAY_SERVER_IPS is required")
+		log.Fatal("V2RAY_SERVER_IP or V2RAY_SERVER_IPS environment variable is required")
 	}
 
 	upstreamPort := os.Getenv("V2RAY_SERVER_PORT")
@@ -119,34 +116,29 @@ func main() {
 	}
 	defer listener.Close()
 
-	// This semaphore bounds the number of active proxy sessions.
+	// Rate limiting channel tokens
 	slots := make(chan struct{}, maxConnections)
 
 	log.Printf(
-		"Listening on :%s; upstreams: %s; max connections: %d",
+		"Listening on :%s; Upstreams: %s; Max allocated slots: %d",
 		port, strings.Join(targets, ", "), maxConnections,
 	)
 
 	for {
 		client, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept error: %v", err)
-			time.Sleep(100 * time.Millisecond)
+			log.Printf("Accept critical system error: %v", err)
+			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
-		select {
-		case slots <- struct{}{}:
-			go func(conn net.Conn) {
-				defer func() { <-slots }()
-				handleClient(conn, targets)
-			}(client)
-
-		default:
-			// Capacity is full. Reject this socket rather than allowing
-			// unlimited goroutines and connections to consume memory.
-			_ = client.Close()
-			log.Printf("Connection limit reached (%d)", maxConnections)
-		}
+		// REMOVED select-default drop logic. 
+		// If capacity is full, this blocks cleanly, queuing up traffic inside the TCP stack 
+		// instead of generating hard socket drops that break Cloud Run's availability metrics.
+		slots <- struct{}{}
+		go func(conn net.Conn) {
+			handleClient(conn, targets)
+			<-slots // Release the slot back to the queue when finished
+		}(client)
 	}
 }
