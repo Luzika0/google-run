@@ -7,66 +7,46 @@ import (
 	"net"
 	"os"
 	"strconv"
-	"strings"
 	"time"
 )
 
 const (
 	defaultPort           = "8080"
-	defaultUpstreamPort   = "443" // Changed to 443 as V2Ray proxies rarely use port 80
-	defaultMaxConnections = 500   // Increased baseline default
-	dialTimeout           = 5 * time.Second
+	defaultUpstreamPort   = "443" // Standard secure port for V2Ray/Xray TLS
+	defaultMaxConnections = 500   // Protects Cloud Run from running out of memory
+	dialTimeout           = 10 * time.Second
 )
 
-func handleClient(client net.Conn, targets []string) {
-	// Let defer handle all connection closures safely exactly once
-	defer client.Close()
+func handleClient(clientConn net.Conn, targetAddr string) {
+	// Defer handles connection closures safely exactly once when the function exits
+	defer clientConn.Close()
 
-	var upstream net.Conn
-	var selectedTarget string
-
-	// Try upstreams in order and stop at the first successful connection.
-	for _, target := range targets {
-		conn, err := net.DialTimeout("tcp", target, dialTimeout)
-		if err != nil {
-			log.Printf("Upstream connection failed (%s): %v", target, err)
-			continue
-		}
-
-		upstream = conn
-		selectedTarget = target
-		break
-	}
-
-	if upstream == nil {
-		log.Print("All upstream connections failed")
+	remoteConn, err := net.DialTimeout("tcp", targetAddr, dialTimeout)
+	if err != nil {
+		log.Printf("Upstream connection to %s failed: %v", targetAddr, err)
 		return
 	}
-	defer upstream.Close()
-
-	log.Printf("Proxying session: %s <-> %s", client.RemoteAddr(), selectedTarget)
+	defer remoteConn.Close()
 
 	errs := make(chan error, 2)
 
 	// Bidirectional data pipe copy
 	go func() {
-		_, err := io.Copy(upstream, client)
+		_, err := io.Copy(remoteConn, clientConn)
 		errs <- err
 	}()
 	go func() {
-		_, err := io.Copy(client, upstream)
+		_, err := io.Copy(clientConn, remoteConn)
 		errs <- err
 	}()
 
 	// Wait for the first stream copy error/completion to finish
-	err := <-errs
-	if err != nil &&
-		!errors.Is(err, net.ErrClosed) &&
-		!errors.Is(err, os.ErrDeadlineExceeded) {
-		log.Printf("TCP forwarding session closed with network status: %v", err)
+	err = <-errs
+	if err != nil && !errors.Is(err, net.ErrClosed) {
+		log.Printf("TCP session closing: %v", err)
 	}
 
-	// Keep execution alive until the second goroutine exits safely to prevent leaks
+	// Wait for the second goroutine to exit to prevent data race leaks
 	<-errs
 }
 
@@ -76,12 +56,9 @@ func main() {
 		port = defaultPort
 	}
 
-	rawIPs := os.Getenv("V2RAY_SERVER_IPS")
-	if rawIPs == "" {
-		rawIPs = os.Getenv("V2RAY_SERVER_IP")
-	}
-	if strings.TrimSpace(rawIPs) == "" {
-		log.Fatal("V2RAY_SERVER_IP or V2RAY_SERVER_IPS environment variable is required")
+	serverIP := os.Getenv("V2RAY_SERVER_IP")
+	if serverIP == "" {
+		log.Fatal("Missing required environment variable V2RAY_SERVER_IP")
 	}
 
 	upstreamPort := os.Getenv("V2RAY_SERVER_PORT")
@@ -89,56 +66,45 @@ func main() {
 		upstreamPort = defaultUpstreamPort
 	}
 
-	var targets []string
-	for _, ip := range strings.Split(rawIPs, ",") {
-		ip = strings.TrimSpace(ip)
-		if ip == "" {
-			continue
-		}
-		targets = append(targets, net.JoinHostPort(ip, upstreamPort))
-	}
-	if len(targets) == 0 {
-		log.Fatal("No valid upstream addresses configured")
-	}
-
 	maxConnections := defaultMaxConnections
 	if value := os.Getenv("MAX_CONNECTIONS"); value != "" {
-		n, err := strconv.Atoi(value)
-		if err != nil || n < 1 {
-			log.Fatal("MAX_CONNECTIONS must be a positive integer")
+		if n, err := strconv.Atoi(value); err == nil && n > 0 {
+			maxConnections = n
 		}
-		maxConnections = n
 	}
 
-	listener, err := net.Listen("tcp", ":"+port)
+	targetAddr := net.JoinHostPort(serverIP, upstreamPort)
+	listenAddr := ":" + port
+
+	listener, err := net.Listen("tcp", listenAddr)
 	if err != nil {
-		log.Fatalf("Cannot listen on port %s: %v", port, err)
+		log.Fatalf("Cannot listen on %s: %v", listenAddr, err)
 	}
 	defer listener.Close()
 
-	// Rate limiting channel tokens
+	// Rate limiting channel tokens (The critical safety mechanism)
 	slots := make(chan struct{}, maxConnections)
 
-	log.Printf(
-		"Listening on :%s; Upstreams: %s; Max allocated slots: %d",
-		port, strings.Join(targets, ", "), maxConnections,
-	)
+	log.Printf("Proxy listening on %s, forwarding to %s (Max Slots: %d)", listenAddr, targetAddr, maxConnections)
 
 	for {
-		client, err := listener.Accept()
+		clientConn, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept critical system error: %v", err)
+			log.Printf("Accept failed: %v", err)
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
 
-		// REMOVED select-default drop logic. 
-		// If capacity is full, this blocks cleanly, queuing up traffic inside the TCP stack 
-		// instead of generating hard socket drops that break Cloud Run's availability metrics.
+		// Anti-burst pacing delay: Spreads out fast connection setups 
+		// by 2 milliseconds to stop "rate exceeded" errors on upstream firewalls.
+		time.Sleep(2 * time.Millisecond)
+
+		// Blocks safely if capacity is reached. Traffic queues up in the 
+		// OS network stack instead of causing heavy container crashes.
 		slots <- struct{}{}
 		go func(conn net.Conn) {
-			handleClient(conn, targets)
-			<-slots // Release the slot back to the queue when finished
-		}(client)
+			handleClient(conn, targetAddr)
+			<-slots // Release the slot back when finished
+		}(clientConn)
 	}
 }
