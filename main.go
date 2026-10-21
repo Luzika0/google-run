@@ -2,51 +2,67 @@
 package main
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net"
 	"os"
+	"strings"
+	"sync"
 	"time"
 )
 
-const (
-	upstreamPort = "80"
-	dialTimeout  = 10 * time.Second
-)
+func handleClient(client net.Conn, targets []string) {
+	defer client.Close()
 
-func handleClient(clientConn net.Conn, targetAddr string) {
-	defer clientConn.Close()
+	var upstream net.Conn
+	var target string
 
-	// Connect to the upstream V2Ray server.
-	remoteConn, err := net.DialTimeout("tcp", targetAddr, dialTimeout)
-	if err != nil {
-		log.Printf("Upstream connection to %s failed: %v", targetAddr, err)
+	// Try each upstream until a connection succeeds.
+	for _, addr := range targets {
+		conn, err := net.DialTimeout("tcp", addr, 5*time.Second)
+		if err != nil {
+			log.Printf("Upstream connection failed (%s): %v", addr, err)
+			continue
+		}
+
+		upstream = conn
+		target = addr
+		break
+	}
+
+	if upstream == nil {
+		log.Printf("All upstream connections failed")
 		return
 	}
-	defer remoteConn.Close()
+	defer upstream.Close()
 
-	log.Printf("Connected to upstream %s", targetAddr)
+	log.Printf("Connected to upstream %s", target)
 
-	// Copy data in both directions.
-	done := make(chan struct{}, 2)
+	var wg sync.WaitGroup
+	wg.Add(2)
 
-	copyData := func(dst, src net.Conn, direction string) {
-		_, copyErr := io.Copy(dst, src)
-		if copyErr != nil {
-			log.Printf("%s ended: %v", direction, copyErr)
+	copyStream := func(dst, src net.Conn, direction string) {
+		defer wg.Done()
+
+		_, err := io.Copy(dst, src)
+		if err != nil &&
+			!errors.Is(err, net.ErrClosed) &&
+			!errors.Is(err, os.ErrDeadlineExceeded) {
+			log.Printf("%s ended: %v", direction, err)
 		}
-		done <- struct{}{}
+
+		// Send EOF to the other side without immediately
+		// closing the entire TCP connection.
+		if tcp, ok := dst.(*net.TCPConn); ok {
+			_ = tcp.CloseWrite()
+		}
 	}
 
-	go copyData(remoteConn, clientConn, "client-to-upstream")
-	go copyData(clientConn, remoteConn, "upstream-to-client")
+	go copyStream(upstream, client, "client-to-upstream")
+	go copyStream(client, upstream, "upstream-to-client")
 
-	// When either direction ends, close both connections so
-	// the other copy operation cannot remain blocked forever.
-	<-done
-	_ = clientConn.Close()
-	_ = remoteConn.Close()
-	<-done
+	wg.Wait()
 }
 
 func main() {
@@ -55,31 +71,51 @@ func main() {
 		port = "8080"
 	}
 
-	serverIP := os.Getenv("V2RAY_SERVER_IP")
-	if serverIP == "" {
-		log.Fatal("Missing required environment variable V2RAY_SERVER_IP")
+	// Comma-separated IP addresses:
+	// V2RAY_SERVER_IPS=47.237.149.117,203.0.113.10
+	rawIPs := os.Getenv("V2RAY_SERVER_IPS")
+	if rawIPs == "" {
+		rawIPs = os.Getenv("V2RAY_SERVER_IP")
+	}
+	if rawIPs == "" {
+		log.Fatal("V2RAY_SERVER_IP or V2RAY_SERVER_IPS is required")
 	}
 
-	targetAddr := net.JoinHostPort(serverIP, upstreamPort)
-	listenAddr := ":" + port
+	upstreamPort := os.Getenv("V2RAY_SERVER_PORT")
+	if upstreamPort == "" {
+		upstreamPort = "80"
+	}
 
-	listener, err := net.Listen("tcp", listenAddr)
+	var targets []string
+	for _, ip := range strings.Split(rawIPs, ",") {
+		ip = strings.TrimSpace(ip)
+		if ip == "" {
+			continue
+		}
+		targets = append(targets, net.JoinHostPort(ip, upstreamPort))
+	}
+
+	if len(targets) == 0 {
+		log.Fatal("No valid upstream addresses configured")
+	}
+
+	listener, err := net.Listen("tcp", ":"+port)
 	if err != nil {
-		log.Fatalf("Cannot listen on %s: %v", listenAddr, err)
+		log.Fatal(err)
 	}
 	defer listener.Close()
 
-	log.Printf("Proxy listening on %s", listenAddr)
-	log.Printf("Forwarding connections to %s", targetAddr)
+	log.Printf("Listening on :%s; upstreams: %s",
+		port, strings.Join(targets, ", "))
 
 	for {
-		clientConn, err := listener.Accept()
+		client, err := listener.Accept()
 		if err != nil {
-			log.Printf("Accept failed: %v", err)
+			log.Printf("Accept error: %v", err)
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
 
-		go handleClient(clientConn, targetAddr)
+		go handleClient(client, targets)
 	}
 }
